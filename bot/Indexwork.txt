@@ -1,0 +1,700 @@
+<?php
+/**
+ * Telegram-бот «Клевер» для klever27.ru
+ * Фиксы: быстрый ACK для всех callback, безопасный выбор «по специалисту»,
+ * русская справка, корректный формат дат дд.мм.гггг, вертикальный выбор клиники,
+ * редактирование календаря в том же сообщении (ожидает обновлённый Calendar.php),
+ * логирование ошибок в /bot/data/error.log, /start в конце списка команд.
+ * Доработки: контакт-шэр без «сменить клинику», 12 позиций/страница, 1 кнопка в строке,
+ * «врач» → «специалист», контекст шага с выбранной клиникой для всех потоков,
+ * Редактирование списка направлений/специалистов в том же сообщении,
+ * Шаг выбора способа связи (перезвонить/WhatsApp/Telegram) перед подтверждением.
+ *
+ * Доп. правки в этой версии:
+ * - Постоянная реплай-клава 2×2, скрываем только на шаге request_contact.
+ * - Кнопка «🏥 Выбрать другую клинику» переименована в «🔄 Сменить клинику».
+ */
+
+declare(strict_types=1);
+mb_internal_encoding('UTF-8');
+mb_language('uni');
+date_default_timezone_set('Asia/Vladivostok');
+
+const BOT_TOKEN    = '7971315021:AAEMCa6GGFThXVn3cqR4H43M48yg5InSCNY';
+const API          = 'https://api.telegram.org/bot'.BOT_TOKEN.'/';
+const FILE_API     = 'https://api.telegram.org/file/bot'.BOT_TOKEN.'/';
+const ADMIN_CHAT   = -1003119914761;
+
+const DATA_DIR     = __DIR__ . '/data';
+const MOD_DIR      = __DIR__ . '/modules';
+const REF_DIR      = __DIR__ . '/ref';
+
+const EMAIL_FROM   = 'noreply@klever27.ru';
+const EMAIL_TO     = 'destroyer@a-smith.ru';
+
+const PAGE_SIZE    = 12; // было 16 — теперь 12, как просили
+
+@is_dir(DATA_DIR) || @mkdir(DATA_DIR, 0775, true);
+
+/* ====== лог ====== */
+function elog(string $s): void {
+    @file_put_contents(DATA_DIR.'/error.log', '['.date('Y-m-d H:i:s')."] ".$s."\n", FILE_APPEND);
+}
+set_error_handler(function($no,$str,$file,$line){
+    elog("PHP[$no] $str @ $file:$line");
+});
+register_shutdown_function(function(){
+    $e = error_get_last();
+    if ($e && in_array($e['type'], [E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR,E_USER_ERROR], true)) {
+        elog("FATAL: {$e['message']} @ {$e['file']}:{$e['line']}");
+    }
+});
+
+require_once MOD_DIR.'/Calendar.php';
+
+/* ====== helpers ====== */
+function tg(string $method, array $params = []): array {
+    $ch = curl_init(API.$method);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER=>true,
+        CURLOPT_POST=>true,
+        CURLOPT_POSTFIELDS=>$params, // <-- БЫЛА ОШИБКА: не должно быть в кавычках
+        CURLOPT_CONNECTTIMEOUT=>6,
+        CURLOPT_TIMEOUT=>12,
+    ]);
+    $out = curl_exec($ch);
+    if ($out === false) { elog("cURL ".curl_errno($ch).": ".curl_error($ch)." in $method"); }
+    curl_close($ch);
+    $j = json_decode((string)$out, true);
+    if (!is_array($j) || !isset($j['ok'])) { elog("Bad TG response in $method: ".substr((string)$out,0,200)); }
+    return is_array($j)?$j:['ok'=>false,'result'=>null];
+}
+function sendMessage(int|string $chatId, string $text, array $extra=[]): void {
+    $p = array_merge(['chat_id'=>$chatId,'text'=>$text,'parse_mode'=>'HTML','disable_web_page_preview'=>true], $extra);
+    tg('sendMessage', $p);
+}
+function editMessageReplyMarkup(int|string $chatId, int $messageId, string $markup): void {
+    tg('editMessageReplyMarkup', ['chat_id'=>$chatId, 'message_id'=>$messageId, 'reply_markup'=>$markup]);
+}
+function editMessageText(int|string $chatId, int $messageId, string $text, string $markup=''): void {
+    $params = ['chat_id'=>$chatId,'message_id'=>$messageId,'text'=>$text,'parse_mode'=>'HTML','disable_web_page_preview'=>true];
+    if ($markup !== '') $params['reply_markup'] = $markup;
+    tg('editMessageText', $params);
+}
+function getFileLink(string $fileId): ?string {
+    $r = tg('getFile', ['file_id'=>$fileId]);
+    if (!($r['ok']??false)) return null;
+    $path = $r['result']['file_path']??null;
+    return $path ? FILE_API.$path : null;
+}
+function inlineButtons(array $rows): string { return json_encode(['inline_keyboard'=>$rows], JSON_UNESCAPED_UNICODE); }
+function kb_back_cancel(string $flow, string $where=''): string {
+    $back = 'back:'.$flow.($where!==''?':'.$where:'');
+    return inlineButtons([[['text'=>'⬅️ Назад','callback_data'=>$back],['text'=>'❌ Отмена','callback_data'=>'cancel']]]);
+}
+function ack(string $cbId, string $text = '', int $cache = 0): void {
+    tg('answerCallbackQuery', ['callback_query_id'=>$cbId, 'text'=>$text, 'cache_time'=>$cache]);
+}
+
+/* ====== email helper (исправляет «абракадабру») ====== */
+/* Отправляем HTML в base64 с корректными заголовками (RFC 2047/2045), CRLF, Date/Message-ID — дружелюбно к Outlook. */
+function sendHtmlMail(string $to, string $subject, string $html): void {
+    $encSubject = mb_encode_mimeheader($subject, 'UTF-8', 'B', "\r\n");
+    $fromName   = mb_encode_mimeheader('Клевер', 'UTF-8', 'B', "\r\n") . ' <'.EMAIL_FROM.'>';
+
+    // Тело письма в base64, переносы 76 символов + CRLF
+    $body = chunk_split(base64_encode($html), 76, "\r\n");
+
+    // Базовые корректные заголовки
+    $headers = [
+        'From: '.$fromName,
+        'Reply-To: '.EMAIL_FROM,
+        'MIME-Version: 1.0',
+        'Date: '.date('r'),
+        'Message-ID: <'.bin2hex(random_bytes(8)).'@klever27.ru>',
+        'X-Mailer: PHP/'.PHP_VERSION,
+        'Content-Type: text/html; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+    ];
+
+    // Используем стандартный mail() — он надёжнее доставляет в разных стэках MTA
+    @mail($to, $encSubject, $body, implode("\r\n", $headers));
+}
+
+/* ====== state ====== */
+function statePath(int $uid): string { return DATA_DIR.'/u_'.$uid.'.json'; }
+function loadState(int $uid): array {
+    $p = statePath($uid);
+    if (!is_file($p)) return ['step'=>null,'flow'=>null,'clinic'=>null,'data'=>[],'files'=>[]];
+    $j = json_decode((string)@file_get_contents($p), true);
+    return is_array($j)?$j:['step'=>null,'flow'=>null,'clinic'=>null,'data'=>[],'files'=>[]];
+}
+function saveState(int $uid, array $st): void { @file_put_contents(statePath($uid), json_encode($st, JSON_UNESCAPED_UNICODE)); }
+function fullReset(int $uid): array { $st=['step'=>null,'flow'=>null,'clinic'=>null,'data'=>[],'files'=>[]]; saveState($uid,$st); return $st; }
+function resetFlow(int $uid, array &$st): void {
+    $clinic = $st['clinic'] ?? null;
+    $st = ['step'=>null,'flow'=>null,'clinic'=>$clinic,'data'=>[],'files'=>[]];
+    saveState($uid,$st);
+}
+
+/* ====== commands ====== */
+function setCommands(): void {
+    $cmds = [
+        ['command'=>'appointment','description'=>'Запись на приём'],
+        ['command'=>'deduction','description'=>'Налоговый вычет'],
+        ['command'=>'feedback','description'=>'Оставить отзыв'],
+        ['command'=>'complaint','description'=>'Жалоба руководителю'],
+        ['command'=>'start','description'=>'Перезапустить бота'], // в конце
+    ];
+    tg('setMyCommands', ['commands'=>json_encode($cmds, JSON_UNESCAPED_UNICODE)]);
+    tg('setChatMenuButton', ['menu_button'=>json_encode(['type'=>'commands'])]);
+}
+function ensureCommandsInit(): void { static $once=null; if($once===null){ setCommands(); $once=true; } }
+
+/* ====== справочники ====== */
+function clinics(): array { return require REF_DIR.'/clinics.php'; }
+function servicesByClinic(string $key): array { return $key==='neuro' ? require REF_DIR.'/services_neuro.php' : require REF_DIR.'/services_speech.php'; }
+function doctorsByClinic(string $key): array { return $key==='neuro' ? require REF_DIR.'/doctors_neuro.php' : require REF_DIR__.'/doctors_speech.php'; }
+function contactsByClinic(string $key): array { return require REF_DIR.'/contacts.php'; }
+
+/* ====== даты ====== */
+function fmtDmy(string $iso): string {
+    if(!preg_match('~^\d{4}-\d{2}-\d{2}$~',$iso)) return $iso;
+    [$y,$m,$d]=explode('-',$iso); return $d.'.'.$m.'.'.$y;
+}
+function parseDmyToIso(string $dmy): ?string {
+    if(!preg_match('~^(\d{2})\.(\d{2})\.(\d{4})$~',trim($dmy),$m)) return null;
+    [$a,$d,$mm,$y]=$m; if(!checkdate((int)$mm,(int)$d,(int)$y)) return null;
+    return sprintf('%04d-%02d-%02d',(int)$y,(int)$mm,(int)$d);
+}
+
+/* ====== реплай-клавиатуры ====== */
+function mainReplyKeyboard(): array {
+    return [
+        [['text'=>'🗓 Запись на приём'], ['text'=>'📞 Контакты']],
+        [['text'=>'🔄 Сменить клинику'], ['text'=>'ℹ️ Справка по боту']],
+    ];
+}
+function sendKeyboardMain(int|string $chatId, string $clinicLabel): void {
+    tg('sendMessage', [
+        'chat_id'=>$chatId,
+        'text'=>"Вы выбрали: <b>{$clinicLabel}</b>\nЧто вас интересует?",
+        'parse_mode'=>'HTML',
+        'reply_markup'=>json_encode(['keyboard'=>mainReplyKeyboard(),'resize_keyboard'=>true,'is_persistent'=>true])
+    ]);
+}
+function restoreMainKeyboard(int|string $chatId): void {
+    // Сервисное сообщение для восстановления постоянной 2×2 клавы
+    tg('sendMessage', [
+        'chat_id'=>$chatId,
+        'text'=>' ',
+        'reply_markup'=>json_encode(['keyboard'=>mainReplyKeyboard(),'resize_keyboard'=>true,'is_persistent'=>true])
+    ]);
+}
+
+/* ====== визуальные блоки / заголовки ====== */
+function clinicSelectKeyboard(): string {
+    $cl = clinics();
+    return inlineButtons([
+        [ ['text'=>$cl['neuro']['title'],  'callback_data'=>'clinic:neuro'] ],
+        [ ['text'=>$cl['speech']['title'], 'callback_data'=>'clinic:speech'] ],
+    ]);
+}
+function askClinic(int $chatId): void {
+    $text = "👋 Добро пожаловать в чат-бот «Клевер»!\n\n🏥 Пожалуйста, выберите клинику:";
+    tg('sendMessage', ['chat_id'=>$chatId,'text'=>$text,'reply_markup'=>clinicSelectKeyboard()]);
+}
+function formatContacts(array $c): string {
+    $t="📞 Контакты — <b>{$c['title']}</b>\n";
+    $t.="📍 Адрес: {$c['address']}\n";
+    $t.="☎️ Телефон: <a href=\"tel:".preg_replace('~\D+~','',$c['phone'])."\">{$c['phone']}</a>\n";
+    if(!empty($c['whatsapp']))$t.="💬 WhatsApp: <a href=\"https://wa.me/".preg_replace('~\D+~','',$c['whatsapp'])."\">{$c['whatsapp']}</a>\n";
+    if(!empty($c['email']))$t.="✉️ Почта: <a href=\"mailto:{$c['email']}\">{$c['email']}</a>\n";
+    if(!empty($c['site']))$t.="🌐 Сайт: <a href=\"{$c['site']}\">{$c['site']}</a>\n";
+    $t.="🕘 График: {$c['hours']}"; return $t;
+}
+
+/* Заголовки шагов с выбранной клиникой */
+function headerAppointment(array $st): string {
+    $cl = clinics(); $ct = $cl[$st['clinic']]['title'] ?? '';
+    return "🗓 <b>Запись на приём:</b> {$ct}\n\n";
+}
+function headerDeduction(array $st): string {
+    $cl = clinics(); $ct = $cl[$st['clinic']]['title'] ?? '';
+    return "💰 <b>Налоговый вычет:</b> {$ct}\n\n";
+}
+function headerComplaint(array $st): string {
+    $cl = clinics(); $ct = $cl[$st['clinic']]['title'] ?? '';
+    return "⚠️ <b>Жалоба руководителю:</b> {$ct}\n\n";
+}
+
+/* ====== резюме ====== */
+function userLink(array $from): string {
+    $id=(int)($from['id']??0); $name=trim(($from['first_name']??'').' '.($from['last_name']??''))?:'Пользователь';
+    $u=$from['username']??null; $link=$u?'https://t.me/'.$u:'tg://user?id='.$id;
+    return '<a href="'.$link.'">'.htmlspecialchars($name).'</a>'.($u?' (@'.htmlspecialchars($u).')':'');
+}
+function summarizeAppointment(string $clinicTitle,array $d,bool $forAdmin=false,string $sender=''):string{
+    $date=isset($d['date'])?fmtDmy($d['date']):'';
+    $txt="📋 <b>Запись на приём — {$clinicTitle}</b>\n".
+         "👤 Имя: ".htmlspecialchars($d['name'])."\n".
+         "📞 Телефон: ".htmlspecialchars($d['phone'])."\n".
+         "🏷 Специалист/направление: ".htmlspecialchars($d['item'])."\n".
+         "📅 Дата: ".htmlspecialchars($date)."\n".
+         "💬 Комментарий: ".htmlspecialchars($d['comment']??'—')."\n".
+         "🔔 Способ связи: ".htmlspecialchars($d['contact_method']??'—');
+    if($forAdmin)$txt.="\n👥 Отправитель: {$sender}\n🔗 Отправлено из бота";
+    return $txt;
+}
+function summarizeDeduction(string $clinicTitle,array $d,bool $forAdmin=false,string $sender=''):string{
+    $txt="💰 <b>Налоговый вычет — {$clinicTitle}</b>\n".
+        "👤 Имя: ".htmlspecialchars($d['name'])."\n".
+        "📞 Телефон: ".htmlspecialchars($d['phone'])."\n".
+        "✉️ Email: ".htmlspecialchars($d['email']);
+    if($forAdmin)$txt.="\n👥 Отправитель: {$sender}\n🔗 Отправлено из бота";
+    return $txt;
+}
+function summarizeComplaint(string $clinicTitle,array $d,array $files,bool $forAdmin=false,string $sender=''):string{
+    $date=isset($d['visit_date'])?fmtDmy($d['visit_date']):'';
+    $t="⚠️ <b>Жалоба руководителю — {$clinicTitle}</b>\n".
+       "👤 Имя: ".htmlspecialchars($d['name'])."\n".
+       "📞 Телефон: ".htmlspecialchars($d['phone'])."\n".
+       "📅 Дата визита: ".htmlspecialchars($date)."\n".
+       "💬 Комментарий: ".htmlspecialchars($d['comment']??'—')."\n";
+    if($files){ $t.="📎 Вложения:\n"; foreach($files as $f){ $link=$f['link']??''; $t.="• ".strtoupper($f['type'])." — ".($link?"<a href=\"{$link}\">ссылка</a>":"—")."\n"; } }
+    if($forAdmin)$t.="👥 Отправитель: {$sender}\n🔗 Отправлено из бота";
+    return rtrim($t);
+}
+
+/* ====== пагинация направлений/специалистов ====== */
+function buildPagedList(array $list, int $page, string $mode): array {
+    $total = count($list);
+    $pages = max(1, (int)ceil(max(1,$total)/PAGE_SIZE));
+    $page  = max(0, min($pages-1, $page));
+    $slice = array_slice($list, $page*PAGE_SIZE, PAGE_SIZE);
+
+    $rows=[];
+    foreach($slice as $it){
+        // одна кнопка в строке
+        $rows[] = [ ['text'=>$it,'callback_data'=>'item:'.substr(md5($it),0,10)] ];
+    }
+    if($pages>1){
+        $rows[] = [
+            ['text'=>'◀️','callback_data'=>'apptpage:'.$mode.':'.max(0,$page-1)],
+            ['text'=>'Стр. '.($page+1).'/'.$pages,'callback_data'=>'noop'],
+            ['text'=>'▶️','callback_data'=>'apptpage:'.$mode.':'.min($pages-1,$page+1)],
+        ];
+    }
+    $rows[]=[['text'=>'⬅️ Назад','callback_data'=>'back:appointment:choose_mode'],['text'=>'❌ Отмена','callback_data'=>'cancel']];
+    return [$rows,$page,$pages];
+}
+
+/* ====== вход ====== */
+$update = json_decode(file_get_contents('php://input') ?: '[]', true);
+if(!$update){ http_response_code(200); exit; }
+ensureCommandsInit();
+
+$cb  = $update['callback_query'] ?? null;
+$msg = $update['message'] ?? null;
+
+/* ====== CALLBACKS ====== */
+if($cb){
+    $cid = $cb['message']['chat']['id'];
+    $uid = $cb['from']['id'];
+    $fromU = $cb['from'];
+    $data = (string)($cb['data']??'');
+    $st = loadState($uid);
+    $cl = clinics();
+
+    // мгновенно гасим «спиннер»
+    ack($cb['id']);
+
+    try {
+
+        /* Отмена */
+        if($data==='cancel'){
+            resetFlow($uid,$st);
+            $label = $st['clinic']&&isset($cl[$st['clinic']])?$cl[$st['clinic']]['title']:'—';
+            sendKeyboardMain($cid,$label);
+            exit;
+        }
+
+        /* Выбор клиники */
+        if(str_starts_with($data,'clinic:')){
+            $key = explode(':',$data,2)[1]??'';
+            if(!isset($cl[$key])){ askClinic($cid); exit; }
+            $st = ['step'=>null,'flow'=>null,'clinic'=>$key,'data'=>[],'files'=>[]];
+            saveState($uid,$st);
+            sendKeyboardMain($cid,$cl[$key]['title']);
+            exit;
+        }
+
+        /* Запись: способ (редактируем текущее сообщение) */
+        if(str_starts_with($data,'apptmode:')){
+            $mode = explode(':',$data,2)[1]??'by_service';
+            $list = $mode==='by_service' ? servicesByClinic($st['clinic']) : doctorsByClinic($st['clinic']);
+            if (!is_array($list)) { throw new \RuntimeException('Справочник вернул не массив'); }
+            $map = [];
+            foreach($list as $it){ $map[substr(md5($it),0,10)] = $it; }
+
+            $st['flow']='appointment';
+            $st['step']='choose_item';
+            $st['data']=['mode'=>$mode,'page'=>0,'map'=>$map];
+            saveState($uid,$st);
+
+            $mid = (int)$cb['message']['message_id'];
+            if(!$list){
+                editMessageText($cid,$mid, headerAppointment($st).'Список пуст. Выберите другой способ или вернитесь назад.',
+                    inlineButtons([[['text'=>'⬅️ Назад','callback_data'=>'back:appointment:choose_mode'],['text'=>'❌ Отмена','callback_data'=>'cancel']]]));
+                exit;
+            }
+            [$rows] = buildPagedList($list,0,$mode);
+            editMessageText(
+                $cid,$mid,
+                headerAppointment($st).($mode==='by_service'?'Выберите направление:':'Выберите специалиста:'),
+                inlineButtons($rows)
+            );
+            exit;
+        }
+
+        /* Запись: пагинация (редактируем текущее сообщение) */
+        if(str_starts_with($data,'apptpage:')){
+            $p = explode(':',$data); // apptpage:mode:page
+            $mode=$p[1]??'by_service'; $page=(int)($p[2]??0);
+            $list = $mode==='by_service' ? servicesByClinic($st['clinic']) : doctorsByClinic($st['clinic']);
+            if (!is_array($list)) { throw new \RuntimeException('Справочник вернул не массив'); }
+            [$rows,$page,$pages]=buildPagedList($list,$page,$mode);
+            $mid = (int)$cb['message']['message_id'];
+            editMessageText(
+                $cid,$mid,
+                headerAppointment($st).($mode==='by_service'?'Выберите направление:':'Выберите специалиста:'),
+                inlineButtons($rows)
+            );
+            exit;
+        }
+
+        /* Запись: выбран элемент */
+        if(str_starts_with($data,'item:')){
+            $code = explode(':',$data,2)[1]??'';
+            $map = $st['data']['map'] ?? [];
+            if(!isset($map[$code])){ sendMessage($cid,headerAppointment($st).'Элемент недоступен, попробуйте снова.'); exit; }
+            $st['data']['item']=$map[$code];
+            $st['step']='get_name';
+            saveState($uid,$st);
+            sendMessage($cid,headerAppointment($st)."Введите ваше имя:",['reply_markup'=>kb_back_cancel('appointment','get_name')]);
+            exit;
+        }
+
+        /* Календарь */
+        if(str_starts_with($data,'cal:')){
+            $parts = explode(':',$data);
+            $cal = new \Klever\Calendar();
+            $res = $cal->handleParts($parts);
+
+            if(($parts[1] ?? '')==='pick' && $res['picked']){
+                $st['data']['date']=$res['picked'];
+                $st['step']='get_comment'; saveState($uid,$st);
+                sendMessage($cid,headerAppointment($st)."Вы выбрали дату: <b>".fmtDmy($res['picked'])."</b>\nДобавьте комментарий (или напишите «-»):",
+                    ['parse_mode'=>'HTML','reply_markup'=>kb_back_cancel('appointment','get_comment')]);
+            } elseif ($res['markup'] ?? null) {
+                // перерисуем СТАРОЕ сообщение календаря
+                $mid = $cb['message']['message_id'];
+                editMessageReplyMarkup($cid, $mid, $res['markup']);
+            }
+            exit;
+        }
+
+        /* Выбор способа связи */
+        if(str_starts_with($data,'contact_method:')){
+            $val = explode(':',$data,2)[1]??'';
+            $labels = [
+                'call'     => '📞 Перезвонить',
+                'whatsapp' => '💬 Написать в WhatsApp',
+                'telegram' => '💬 Написать в Telegram',
+            ];
+            $st['data']['contact_method'] = $labels[$val] ?? $val;
+            $st['step']='confirm'; saveState($uid,$st);
+
+            $clinicTitle=clinics()[$st['clinic']]['title'];
+            $sumUser=summarizeAppointment($clinicTitle,$st['data'],false);
+            $kb=[[['text'=>'⬅️ Назад','callback_data'=>'back:appointment:get_contact_method'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:appointment']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+            sendMessage($cid,$sumUser,['reply_markup'=>inlineButtons($kb)]);
+            exit;
+        }
+
+        /* Подтверждения */
+        if($data==='confirm:appointment'){
+            $clinicTitle=clinics()[$st['clinic']]['title']; $sender=userLink($fromU);
+            $txtAdmin=summarizeAppointment($clinicTitle,$st['data'],true,$sender);
+            sendMessage(ADMIN_CHAT,$txtAdmin);
+            sendMessage($cid,"✅ Заявка отправлена! Спасибо, мы свяжемся с вами в ближайшее время.");
+            resetFlow($uid,$st); exit;
+        }
+        if($data==='confirm:deduction'){
+            $clinicTitle=clinics()[$st['clinic']]['title']; $sender=userLink($fromU);
+            $txtAdmin=summarizeDeduction($clinicTitle,$st['data'],true,$sender);
+            sendMessage(ADMIN_CHAT,$txtAdmin);
+            sendHtmlMail(EMAIL_TO,'Заполнение формы налогового вычета', nl2br($txtAdmin));
+            sendMessage($cid,"✅ Заявка отправлена! Спасибо, мы свяжемся с вами в ближайшее время.");
+            resetFlow($uid,$st); exit;
+        }
+        if($data==='confirm:complaint'){
+            $clinicTitle=clinics()[$st['clinic']]['title']; $sender=userLink($fromU);
+            $txtAdmin=summarizeComplaint($clinicTitle,$st['data'],$st['files'],true,$sender);
+            sendMessage(ADMIN_CHAT,$txtAdmin);
+            sendHtmlMail(EMAIL_TO,'Жалоба руководителю', nl2br($txtAdmin));
+            sendMessage($cid,"✅ Жалоба отправлена руководителю. Спасибо, что сообщили о проблеме — мы разберёмся.");
+            resetFlow($uid,$st); exit;
+        }
+
+        /* Жалоба: ветка с вложениями */
+        if($data==='attach_yes'){
+            $st['step']='attach_files'; saveState($uid,$st);
+            sendMessage($cid,headerComplaint($st).'Пришлите фото/видео/документы. Когда будете готовы — нажмите «Подтвердить».',[
+                'reply_markup'=>inlineButtons([[['text'=>'⬅️ Назад','callback_data'=>'back:complaint:get_comment'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:complaint']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]])
+            ]); exit;
+        }
+        if($data==='attach_no'){
+            $st['step']='confirm'; saveState($uid,$st);
+            $clinicTitle=clinics()[$st['clinic']]['title'];
+            $sumUser=summarizeComplaint($clinicTitle,$st['data'],$st['files'],false);
+            sendMessage($cid,$sumUser,['reply_markup'=>inlineButtons([[['text'=>'⬅️ Назад','callback_data'=>'back:complaint:get_comment'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:complaint']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]])]); exit;
+        }
+
+        /* Назад */
+        if(str_starts_with($data,'back:')){
+            $parts=explode(':',$data); $flow=$parts[1]??''; $to=$parts[2]??'';
+            if($flow==='appointment'){
+                if($to==='choose_mode'){
+                    $st['step']='choose_mode'; saveState($uid,$st);
+                    $kb=[[['text'=>'По направлению','callback_data'=>'apptmode:by_service'],['text'=>'По специалисту','callback_data'=>'apptmode:by_doctor']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+                    sendMessage($cid,headerAppointment($st).'Выберите способ записи:',['reply_markup'=>inlineButtons($kb)]);
+                }elseif($to==='get_name'){
+                    $st['step']='get_name'; unset($st['data']['phone']); saveState($uid,$st);
+                    sendMessage($cid,headerAppointment($st)."Введите ваше имя:",['reply_markup'=>kb_back_cancel('appointment','get_name')]);
+                }elseif($to==='get_phone'){
+                    $st['step']='get_phone'; unset($st['data']['date']); saveState($uid,$st);
+                    sharePhoneAsk($cid,'appointment');
+                }elseif($to==='get_date'){
+                    $st['step']='get_date'; unset($st['data']['date']); saveState($uid,$st);
+                    sendCalendarAsk($cid,$st);
+                }elseif($to==='get_comment'){
+                    $st['step']='get_comment'; saveState($uid,$st);
+                    sendMessage($cid,headerAppointment($st)."Добавьте комментарий (или «-»):",['reply_markup'=>kb_back_cancel('appointment','get_comment')]);
+                }elseif($to==='get_contact_method'){
+                    $st['step']='get_comment'; saveState($uid,$st);
+                    // возвращаемся к комментарию
+                    sendMessage($cid,headerAppointment($st)."Добавьте комментарий (или «-»):",['reply_markup'=>kb_back_cancel('appointment','get_comment')]);
+                }
+            }elseif($flow==='deduction'){
+                if($to==='get_name'){
+                    $st['step']='get_name'; $st['data']=[]; saveState($uid,$st);
+                    sendMessage($cid,headerDeduction($st)."Введите ваше имя:",['reply_markup'=>kb_back_cancel('deduction','get_name')]);
+                }elseif($to==='get_phone'){
+                    $st['step']='get_phone'; unset($st['data']['email']); saveState($uid,$st);
+                    sharePhoneAsk($cid,'deduction');
+                }
+            }elseif($flow==='complaint'){
+                if($to==='get_name'){
+                    $st['step']='get_name'; $st['files']=[]; $st['data']=[]; saveState($uid,$st);
+                    sendMessage($cid,headerComplaint($st)."Введите ваше имя:",['reply_markup'=>kb_back_cancel('complaint','get_name')]);
+                }elseif($to==='get_phone'){
+                    $st['step']='get_phone'; unset($st['data']['visit_date']); saveState($uid,$st);
+                    sharePhoneAsk($cid,'complaint');
+                }elseif($to==='get_visit_date'){
+                    $st['step']='get_visit_date'; saveState($uid,$st);
+                    sendMessage($cid,headerComplaint($st).'Введите дату визита (например, 19.11.2025):',['reply_markup'=>kb_back_cancel('complaint','get_visit_date')]);
+                }elseif($to==='get_comment'){
+                    $st['step']='get_comment'; saveState($uid,$st);
+                    sendMessage($cid,headerComplaint($st).'Опишите ситуацию.',['reply_markup'=>kb_back_cancel('complaint','get_comment')]);
+                }
+            }
+            exit;
+        }
+
+    } catch (\Throwable $e) {
+        elog("CB error: ".$e->getMessage());
+        sendMessage($cid, "⚠️ Произошла ошибка. Попробуйте ещё раз /start");
+    }
+    exit;
+}
+
+/* ====== MESSAGES ====== */
+function sharePhoneAsk(int|string $cid,string $flow):void{
+    // только «Поделиться контактом», без «сменить клинику»
+    tg('sendMessage',[
+        'chat_id'=>$cid,
+        'text'=>'Отправьте номер телефона или поделитесь контактом:',
+        'reply_markup'=>json_encode([
+            'keyboard'=>[[['text'=>'📱 Поделиться контактом','request_contact'=>true]]],
+            'resize_keyboard'=>true
+        ])
+    ]);
+    tg('sendMessage',['chat_id'=>$cid,'text'=>'','reply_markup'=>kb_back_cancel($flow,'get_phone')]);
+}
+function sendCalendarAsk(int|string $cid, array $st):void{
+    $cal=new \Klever\Calendar(); [$markup]=$cal->render((int)date('Y'),(int)date('n'));
+    tg('sendMessage',['chat_id'=>$cid,'text'=>headerAppointment($st).'Выберите дату визита:','parse_mode'=>'HTML','reply_markup'=>$markup]);
+}
+
+if($msg){
+    $cid=$msg['chat']['id']; $uid=$msg['from']['id']; $fromU=$msg['from'];
+    $text=trim((string)($msg['text']??'')); $st=loadState($uid); $cl=clinics();
+
+    /* Контакт (после шаринга — сразу вернуть постоянную 2×2 клаву) */
+    if(isset($msg['contact']) && $st['flow'] && $st['step']==='get_phone'){
+        $phone=$msg['contact']['phone_number']??'';
+        $st['data']['phone']=$phone;
+
+        // вернуть основную клавиатуру
+        restoreMainKeyboard($cid);
+
+        if($st['flow']==='appointment'){ $st['step']='get_date'; saveState($uid,$st); sendCalendarAsk($cid,$st); exit; }
+        if($st['flow']==='deduction'){ $st['step']='get_email'; saveState($uid,$st); sendMessage($cid,headerDeduction($st).'Введите вашу электронную почту:',['reply_markup'=>kb_back_cancel('deduction','get_phone')]); exit; }
+        if($st['flow']==='complaint'){ $st['step']='get_visit_date'; saveState($uid,$st); sendMessage($cid,headerComplaint($st).'Введите дату визита (например, 19.11.2025):',['reply_markup'=>kb_back_cancel('complaint','get_visit_date')]); exit; }
+    }
+
+    /* Вложения для жалобы */
+    if((isset($msg['photo'])||isset($msg['document'])||isset($msg['video'])) && $st['flow']==='complaint'){
+        if(isset($msg['photo'])){ $ph=end($msg['photo']); $fid=$ph['file_id']; $link=getFileLink($fid); $st['files'][]=['type'=>'photo','file_id'=>$fid,'link'=>$link]; }
+        if(isset($msg['document'])){ $fid=$msg['document']['file_id']; $link=getFileLink($fid); $st['files'][]=['type'=>'document','file_id'=>$fid,'link'=>$link]; }
+        if(isset($msg['video'])){ $fid=$msg['video']['file_id']; $link=getFileLink($fid); $st['files'][]=['type'=>'video','file_id'=>$fid,'link'=>$link]; }
+        saveState($uid,$st);
+        sendMessage($cid,headerComplaint($st)."📎 Файл добавлен. Можете прикрепить ещё или нажмите «Подтвердить».",
+            ['reply_markup'=>inlineButtons([[['text'=>'⬅️ Назад','callback_data'=>'back:complaint:get_comment'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:complaint']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]])]); exit;
+    }
+
+    /* Полный перезапуск (/start — в конце списка команд) */
+    if($text==='/start'){ $st=fullReset($uid); askClinic($cid); exit; }
+
+    /* Справка (человечный текст) */
+    if($text==='ℹ️ Справка по боту' || $text==='/help'){
+        sendMessage($cid,"Я чат-бот центра «Клевер». Помогаю быстро:\n• записаться на приём к специалистам,\n• оформить налоговый вычет за лечение,\n• оставить отзыв или направить жалобу руководителю,\n• получить контакты и справочную информацию.\n\nДоступные команды:\n/appointment — Запись на приём\n/deduction — Налоговый вычет\n/feedback — Отзыв\n/complaint — Жалоба\n/start — Перезапуск");
+        exit;
+    }
+
+    /* Отзыв */
+    if($text==='/feedback' || $text==='⭐ Отзыв'){
+        $row=[[['text'=>'💚 Неврология','url'=>'https://2gis.ru/khabarovsk/firm/4926340373508276/135.066627%2C48.507797/tab/reviews?m=135.066632%2C48.507778%2F18.68'],['text'=>'🧩 Центр развития речи','url'=>'https://2gis.ru/khabarovsk/firm/70000001029431055/135.088006%2C48.490784/tab/reviews?m=135.087791%2C48.490347%2F17.88']]];
+        sendMessage($cid,'Выберите площадку для отзыва:',['reply_markup'=>inlineButtons($row)]); exit;
+    }
+
+    /* Точки входа */
+    if($text==='/appointment' || $text==='🗓 Запись на приём'){
+        if(!$st['clinic']){ askClinic($cid); exit; }
+        $st['flow']='appointment'; $st['step']='choose_mode'; $st['data']=[]; $st['files']=[]; saveState($uid,$st);
+        $kb=[[['text'=>'По направлению','callback_data'=>'apptmode:by_service'],['text'=>'По специалисту','callback_data'=>'apptmode:by_doctor']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+        sendMessage($cid,headerAppointment($st).'Выберите способ записи:',['reply_markup'=>inlineButtons($kb)]); exit;
+    }
+    if($text==='/deduction' || $text==='💰 Налоговый вычет'){
+        if(!$st['clinic']){ askClinic($cid); exit; }
+        if($st['clinic']!=='neuro'){
+            $kb=[[['text'=>'Переключиться на Центр неврологии','callback_data'=>'clinic:neuro']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+            sendMessage($cid,headerDeduction($st).'Эта функция доступна только в Центре неврологии «Клевер». Хотите переключиться?',['reply_markup'=>inlineButtons($kb)]); exit;
+        }
+        $st=['step'=>'get_name','flow'=>'deduction','clinic'=>$st['clinic'],'data'=>[],'files'=>[]]; saveState($uid,$st);
+        sendMessage($cid,headerDeduction($st)."Введите ваше имя:",['reply_markup'=>kb_back_cancel('deduction','get_name')]); exit;
+    }
+    if($text==='/complaint' || $text==='⚠️ Жалоба руководителю'){
+        if(!$st['clinic']){ askClinic($cid); exit; }
+        $st=['step'=>'get_name','flow'=>'complaint','clinic'=>$st['clinic'],'data'=>[],'files'=>[]]; saveState($uid,$st);
+        sendMessage($cid,headerComplaint($st)."Введите ваше имя:",['reply_markup'=>kb_back_cancel('complaint','get_name')]); exit;
+    }
+    if($text==='📞 Контакты'){
+        if(!$st['clinic']){ askClinic($cid); exit; }
+        $cAll=contactsByClinic($st['clinic']); $c=$cAll[$st['clinic']];
+        sendMessage($cid,formatContacts($c)); exit;
+    }
+    if($text==='🔄 Сменить клинику'){ $st=fullReset($uid); askClinic($cid); exit; }
+
+    /* Потоки */
+    if(!$st['clinic']){ askClinic($cid); exit; }
+
+    // appointment
+    if($st['flow']==='appointment'){
+        if($st['step']==='choose_mode'){
+            $kb=[[['text'=>'По направлению','callback_data'=>'apptmode:by_service'],['text'=>'По специалисту','callback_data'=>'apptmode:by_doctor']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+            sendMessage($cid,headerAppointment($st).'Выберите способ записи:',['reply_markup'=>inlineButtons($kb)]); exit;
+        }
+        if($st['step']==='get_name'){
+            if($text===''){ sendMessage($cid,headerAppointment($st).'Введите имя:',['reply_markup'=>kb_back_cancel('appointment','get_name')]); exit; }
+            $st['data']['name']=$text; $st['step']='get_phone'; saveState($uid,$st);
+            sharePhoneAsk($cid,'appointment'); exit;
+        }
+        if($st['step']==='get_phone'){
+            if(!preg_match('~\+?\d{10,15}~',$text)){ sendMessage($cid,headerAppointment($st).'Укажите телефон в формате +7XXXXXXXXXX:',['reply_markup'=>kb_back_cancel('appointment','get_phone')]); exit; }
+            $st['data']['phone']=$text; $st['step']='get_date'; saveState($uid,$st);
+            sendCalendarAsk($cid,$st); exit;
+        }
+        if($st['step']==='get_comment'){
+            $st['data']['comment']=($text==='-'?'':$text);
+            $st['step']='get_contact_method'; saveState($uid,$st);
+            $kb = [
+                [['text'=>'📞 Перезвонить','callback_data'=>'contact_method:call']],
+                [['text'=>'💬 Написать в WhatsApp','callback_data'=>'contact_method:whatsapp']],
+                [['text'=>'💬 Написать в Telegram','callback_data'=>'contact_method:telegram']],
+                [['text'=>'⬅️ Назад','callback_data'=>'back:appointment:get_contact_method'],['text'=>'❌ Отмена','callback_data'=>'cancel']],
+            ];
+            sendMessage($cid,headerAppointment($st)."Выберите удобный способ связи:",['reply_markup'=>inlineButtons($kb)]);
+            exit;
+        }
+        if($st['step']==='confirm'){
+            // защита: если пользователь прислал текст на этапе подтверждения — просто покажем резюме и кнопки
+            $clinicTitle=clinics()[$st['clinic']]['title']; $sumUser=summarizeAppointment($clinicTitle,$st['data'],false);
+            $kb=[[['text'=>'⬅️ Назад','callback_data'=>'back:appointment:get_contact_method'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:appointment']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+            sendMessage($cid,$sumUser,['reply_markup'=>inlineButtons($kb)]); exit;
+        }
+    }
+
+    // deduction
+    if($st['flow']==='deduction'){
+        if($st['step']==='get_name'){
+            if($text===''){ sendMessage($cid,headerDeduction($st).'Введите имя:',['reply_markup'=>kb_back_cancel('deduction','get_name')]); exit; }
+            $st['data']['name']=$text; $st['step']='get_phone'; saveState($uid,$st);
+            sharePhoneAsk($cid,'deduction'); exit;
+        }
+        if($st['step']==='get_phone'){
+            if(!preg_match('~\+?\d{10,15}~',$text)){ sendMessage($cid,headerDeduction($st).'Укажите телефон в формате +7XXXXXXXXXX:',['reply_markup'=>kb_back_cancel('deduction','get_phone')]); exit; }
+            $st['data']['phone']=$text; $st['step']='get_email'; saveState($uid,$st);
+            sendMessage($cid,headerDeduction($st).'Введите вашу электронную почту:',['reply_markup'=>kb_back_cancel('deduction','get_phone')]); exit;
+        }
+        if($st['step']==='get_email'){
+            if(!filter_var($text,FILTER_VALIDATE_EMAIL)){ sendMessage($cid,headerDeduction($st).'Укажите корректный e-mail:',['reply_markup'=>kb_back_cancel('deduction','get_phone')]); exit; }
+            $st['data']['email']=$text; $st['step']='confirm'; saveState($uid,$st);
+            $clinicTitle=clinics()[$st['clinic']]['title']; $sumUser=summarizeDeduction($clinicTitle,$st['data'],false);
+            $kb=[[['text'=>'⬅️ Назад','callback_data'=>'back:deduction:get_phone'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:deduction']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]];
+            sendMessage($cid,$sumUser,['reply_markup'=>inlineButtons($kb)]); exit;
+        }
+    }
+
+    // complaint
+    if($st['flow']==='complaint'){
+        if($st['step']==='get_name'){
+            if($text===''){ sendMessage($cid,headerComplaint($st).'Введите имя:',['reply_markup'=>kb_back_cancel('complaint','get_name')]); exit; }
+            $st['data']['name']=$text; $st['step']='get_phone'; saveState($uid,$st);
+            sharePhoneAsk($cid,'complaint'); exit;
+        }
+        if($st['step']==='get_phone'){
+            if(!preg_match('~\+?\d{10,15}~',$text)){ sendMessage($cid,headerComplaint($st).'Укажите телефон в формате +7XXXXXXXXXX:',['reply_markup'=>kb_back_cancel('complaint','get_phone')]); exit; }
+            $st['data']['phone']=$text; $st['step']='get_visit_date'; saveState($uid,$st);
+            sendMessage($cid,headerComplaint($st).'Введите дату визита (например, 19.11.2025):',['reply_markup'=>kb_back_cancel('complaint','get_visit_date')]); exit;
+        }
+        if($st['step']==='get_visit_date'){
+            $iso=parseDmyToIso($text); if(!$iso){ sendMessage($cid,headerComplaint($st).'Укажите дату в формате дд.мм.гггг:',['reply_markup'=>kb_back_cancel('complaint','get_visit_date')]); exit; }
+            $st['data']['visit_date']=$iso; $st['step']='get_comment'; saveState($uid,$st);
+            sendMessage($cid,headerComplaint($st).'Опишите ситуацию.',['reply_markup'=>kb_back_cancel('complaint','get_comment')]); exit;
+        }
+        if($st['step']==='get_comment'){
+            $st['data']['comment']=$text; $st['step']='attach_choice'; saveState($uid,$st);
+            sendMessage($cid,headerComplaint($st).'Хотите прикрепить файлы?',['reply_markup'=>inlineButtons([[['text'=>'Да','callback_data'=>'attach_yes'],['text'=>'Нет','callback_data'=>'attach_no']],[['text'=>'⬅️ Назад','callback_data'=>'back:complaint#get_comment'],['text'=>'❌ Отмена','callback_data'=>'cancel']]])]); exit;
+        }
+        if($st['step']==='attach_files'){
+            sendMessage($cid,headerComplaint($st).'Пришлите фото/видео/документы.',['reply_markup'=>inlineButtons([[['text'=>'⬅️ Назад','callback_data'=>'back:complaint:get_comment'],['text'=>'✅ Подтвердить','callback_data'=>'confirm:complaint']],[['text'=>'❌ Отмена','callback_data'=>'cancel']]])]); exit;
+        }
+    }
+
+    if($st['clinic']&&isset($cl[$st['clinic']])) sendKeyboardMain($cid,$cl[$st['clinic']]['title']); else askClinic($cid);
+    exit;
+}
+
+http_response_code(200);
